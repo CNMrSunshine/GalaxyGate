@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include "syscalls.h"
 #include "nt.h"
+
+#define DEBUG
+
 typedef struct _SFParams {
     DWORD ParamNum;
     BOOL IsLegacy;
@@ -10,10 +13,10 @@ typedef struct _SFParams {
     DWORD_PTR param[17];
 } SFParams, * PSFParams;
 DWORD* NullPointer = NULL;
-SFParams Params = { 0 }; // Global varible used to pass the real parameters to VEH
+SFParams Params = { 0 }; // 全局变量 用于向VEH传递真实的函数调用参数
 
 /*========================================
-Using SysWhisper 3 to Search for SSNs and Syscall Addresses
+以下代码属于GitHub项目 SysWhisper3 的部分引用
 https://github.com/klezVirus/SysWhispers3
 ========================================*/
 SW3_SYSCALL_LIST SW3_SyscallList;
@@ -151,7 +154,9 @@ PVOID SW3_GetSyscallAddress(DWORD FunctionHash)
     {
         if (FunctionHash == SW3_SyscallList.Entries[i].Hash)
         {
-            return SW3_SyscallList.Entries[i].SyscallAddress;
+            PVOID SyscallAddr = SW3_SyscallList.Entries[i].SyscallAddress;
+            memset(&SW3_SyscallList, 0, sizeof(SW3_SyscallList));
+            return SyscallAddr;
         }
     }
 
@@ -167,6 +172,7 @@ DWORD SW3_GetSyscallNumber(DWORD FunctionHash)
     {
         if (FunctionHash == SW3_SyscallList.Entries[i].Hash)
         {
+            memset(&SW3_SyscallList, 0, sizeof(SW3_SyscallList));
             return i;
         }
     }
@@ -174,7 +180,7 @@ DWORD SW3_GetSyscallNumber(DWORD FunctionHash)
     return -1;
 }
 /*========================================
-Using SysWhisper 3 to Search for SSNs and Syscall Addresses
+以上代码属于GitHub项目 SysWhisper3 的部分引用
 https://github.com/klezVirus/SysWhispers3
 ========================================*/
 
@@ -214,7 +220,7 @@ LONG WINAPI ExceptionHandler(PEXCEPTION_POINTERS pExceptInfo) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// 加强版动态堆栈欺骗 AdvDSS
+// Galaxy Gate - NextGen
 NTSTATUS SFNtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength) {
     Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)ObjectAttributes; Params.param[4] = (DWORD_PTR)IoStatusBlock; Params.param[5] = (DWORD_PTR)AllocationSize; Params.param[6] = (DWORD_PTR)FileAttributes; Params.param[7] = (DWORD_PTR)ShareAccess; Params.param[8] = (DWORD_PTR)CreateDisposition; Params.param[9] = (DWORD_PTR)CreateOptions; Params.param[10] = (DWORD_PTR)EaBuffer; Params.param[11] = (DWORD_PTR)EaLength; Params.ParamNum = 11; Params.FuncHash = 0x0BDDB5F9C; Params.IsLegacy = 0; *NullPointer = 1; TCHAR tempFileName[MAX_PATH];
     GetTempFileName(0, 0, 0, tempFileName);return 0;
@@ -224,7 +230,7 @@ NTSTATUS SFNtWriteFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRouti
     WritePrivateProfileString("StarFly", "Version", "2.0", "Version.ini"); return 0;
 } // WritePrivateProfileString -> NtWriteFile
 
-// 动态堆栈欺骗 DSS
+// Galaxy Gate - Legacy
 NTSTATUS SFNtAccessCheck(PSECURITY_DESCRIPTOR pSecurityDescriptor, HANDLE ClientToken, ACCESS_MASK DesiaredAccess, PGENERIC_MAPPING GenericMapping, PPRIVILEGE_SET PrivilegeSet, PULONG PrivilegeSetLength, PACCESS_MASK GrantedAccess, PBOOLEAN AccessStatus) { Params.param[1] = (DWORD_PTR)pSecurityDescriptor; Params.param[2] = (DWORD_PTR)ClientToken; Params.param[3] = (DWORD_PTR)DesiaredAccess; Params.param[4] = (DWORD_PTR)GenericMapping; Params.param[5] = (DWORD_PTR)PrivilegeSet; Params.param[6] = (DWORD_PTR)PrivilegeSetLength; Params.param[7] = (DWORD_PTR)GrantedAccess; Params.param[8] = (DWORD_PTR)AccessStatus; Params.ParamNum = 8; Params.FuncHash = 0x0429E3D77; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtWorkerFactoryWorkerReady(HANDLE WorkerFactoryHandle) { Params.param[1] = (DWORD_PTR)WorkerFactoryHandle; Params.ParamNum = 1; Params.FuncHash = 0x093BB77D7; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtAcceptConnectPort(PHANDLE ServerPortHandle, ULONG AlternativeReceivePortHandle, PPORT_MESSAGE ConnectionReply, BOOLEAN AcceptConnection, PPORT_SECTION_WRITE ServerSharedMemory, PPORT_SECTION_READ ClientSharedMemory) { Params.param[1] = (DWORD_PTR)ServerPortHandle; Params.param[2] = (DWORD_PTR)AlternativeReceivePortHandle; Params.param[3] = (DWORD_PTR)ConnectionReply; Params.param[4] = (DWORD_PTR)AcceptConnection; Params.param[5] = (DWORD_PTR)ServerSharedMemory; Params.param[6] = (DWORD_PTR)ClientSharedMemory; Params.ParamNum = 6; Params.FuncHash = 0x024B23D18; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
