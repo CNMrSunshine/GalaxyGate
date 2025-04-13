@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include "syscalls.h"
 #include "nt.h"
-
+#include <stdbool.h>
 #define DEBUG
 
 typedef struct _SFParams {
@@ -12,6 +12,7 @@ typedef struct _SFParams {
     DWORD FuncHash;
     DWORD_PTR param[17];
 } SFParams, * PSFParams;
+
 DWORD* NullPointer = NULL;
 SFParams Params = { 0 }; // 全局变量 用于向VEH传递真实的函数调用参数
 
@@ -19,8 +20,6 @@ SFParams Params = { 0 }; // 全局变量 用于向VEH传递真实的函数调用
 以下代码属于GitHub项目 SysWhisper3 的部分引用
 https://github.com/klezVirus/SysWhispers3
 ========================================*/
-SW3_SYSCALL_LIST SW3_SyscallList;
-
 DWORD SW3_HashSyscall(PCSTR FunctionName)
 {
     DWORD i = 0;
@@ -41,19 +40,13 @@ PVOID SC_Address(PVOID NtApiAddress)
     PVOID SyscallAddress;
     BYTE syscall_code[] = { 0x0f, 0x05, 0xc3 };
     ULONG distance_to_syscall = 0x12;
-    // we don't really care if there is a 'jmp' between
-    // NtApiAddress and the 'syscall; ret' instructions
     SyscallAddress = SW3_RVA2VA(PVOID, NtApiAddress, distance_to_syscall);
     if (!memcmp((PVOID)syscall_code, SyscallAddress, sizeof(syscall_code)))
     {
-        // we can use the original code for this system call :)
         return SyscallAddress;
     }
-    // the 'syscall; ret' intructions have not been found,
-    // we will try to use one near it, similarly to HalosGate
     for (ULONG32 num_jumps = 1; num_jumps < searchLimit; num_jumps++)
     {
-        // let's try with an Nt* API below our syscall
         SyscallAddress = SW3_RVA2VA(
             PVOID,
             NtApiAddress,
@@ -62,7 +55,6 @@ PVOID SC_Address(PVOID NtApiAddress)
         {
             return SyscallAddress;
         }
-        // let's try with an Nt* API above our syscall
         SyscallAddress = SW3_RVA2VA(
             PVOID,
             NtApiAddress,
@@ -75,108 +67,120 @@ PVOID SC_Address(PVOID NtApiAddress)
     return NULL;
 }
 
-BOOL SW3_PopulateSyscallList()
+static PVOID GetNtdllBase()
 {
-    if (SW3_SyscallList.Count) return TRUE;
     PSW3_PEB Peb = (PSW3_PEB)__readgsqword(0x60);
     PSW3_PEB_LDR_DATA Ldr = Peb->Ldr;
-    PIMAGE_EXPORT_DIRECTORY ExportDirectory = NULL;
-    PVOID DllBase = NULL;
-    // Get the DllBase address of NTDLL.dll. NTDLL is not guaranteed to be the second
-    // in the list, so it's safer to loop through the full list and find it.
     PSW3_LDR_DATA_TABLE_ENTRY LdrEntry;
     for (LdrEntry = (PSW3_LDR_DATA_TABLE_ENTRY)Ldr->Reserved2[1]; LdrEntry->DllBase != NULL; LdrEntry = (PSW3_LDR_DATA_TABLE_ENTRY)LdrEntry->Reserved1[0])
     {
-        DllBase = LdrEntry->DllBase;
+        PVOID DllBase = LdrEntry->DllBase;
         PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER)DllBase;
         PIMAGE_NT_HEADERS NtHeaders = SW3_RVA2VA(PIMAGE_NT_HEADERS, DllBase, DosHeader->e_lfanew);
         PIMAGE_DATA_DIRECTORY DataDirectory = (PIMAGE_DATA_DIRECTORY)NtHeaders->OptionalHeader.DataDirectory;
         DWORD VirtualAddress = DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
         if (VirtualAddress == 0) continue;
-        ExportDirectory = (PIMAGE_EXPORT_DIRECTORY)SW3_RVA2VA(ULONG_PTR, DllBase, VirtualAddress);
-        // If this is NTDLL.dll, exit loop.
+        PIMAGE_EXPORT_DIRECTORY ExportDirectory = (PIMAGE_EXPORT_DIRECTORY)SW3_RVA2VA(ULONG_PTR, DllBase, VirtualAddress);
         PCHAR DllName = SW3_RVA2VA(PCHAR, DllBase, ExportDirectory->Name);
         if ((*(ULONG*)DllName | 0x20202020) != 0x6c64746e) continue;
-        if ((*(ULONG*)(DllName + 4) | 0x20202020) == 0x6c642e6c) break;
+        if ((*(ULONG*)(DllName + 4) | 0x20202020) == 0x6c642e6c)
+            return DllBase;
     }
-    if (!ExportDirectory) return FALSE;
-    DWORD NumberOfNames = ExportDirectory->NumberOfNames;
-    PDWORD Functions = SW3_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfFunctions);
-    PDWORD Names = SW3_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfNames);
-    PWORD Ordinals = SW3_RVA2VA(PWORD, DllBase, ExportDirectory->AddressOfNameOrdinals);
-    // Populate SW3_SyscallList with unsorted Zw* entries.
-    DWORD i = 0;
-    PSW3_SYSCALL_ENTRY Entries = SW3_SyscallList.Entries;
-    do
-    {
-        PCHAR FunctionName = SW3_RVA2VA(PCHAR, DllBase, Names[NumberOfNames - 1]);
-        // Is this a system call?
-        if (*(USHORT*)FunctionName == 0x775a)
-        {
-            Entries[i].Hash = SW3_HashSyscall(FunctionName);
-            Entries[i].Address = Functions[Ordinals[NumberOfNames - 1]];
-            Entries[i].SyscallAddress = SC_Address(SW3_RVA2VA(PVOID, DllBase, Entries[i].Address));
-            i++;
-            if (i == SW3_MAX_ENTRIES) break;
-        }
-    } while (--NumberOfNames);
-    // Save total number of system calls found.
-    SW3_SyscallList.Count = i;
-    // Sort the list by address in ascending order.
-    for (DWORD i = 0; i < SW3_SyscallList.Count - 1; i++)
-    {
-        for (DWORD j = 0; j < SW3_SyscallList.Count - i - 1; j++)
-        {
-            if (Entries[j].Address > Entries[j + 1].Address)
-            {
-                SW3_SYSCALL_ENTRY TempEntry;
-                TempEntry.Hash = Entries[j].Hash;
-                TempEntry.Address = Entries[j].Address;
-                TempEntry.SyscallAddress = Entries[j].SyscallAddress;
-                Entries[j].Hash = Entries[j + 1].Hash;
-                Entries[j].Address = Entries[j + 1].Address;
-                Entries[j].SyscallAddress = Entries[j + 1].SyscallAddress;
-                Entries[j + 1].Hash = TempEntry.Hash;
-                Entries[j + 1].Address = TempEntry.Address;
-                Entries[j + 1].SyscallAddress = TempEntry.SyscallAddress;
-            }
-        }
-    }
-    return TRUE;
+    return NULL;
 }
 
 PVOID SW3_GetSyscallAddress(DWORD FunctionHash)
 {
-    // Ensure SW3_SyscallList is populated.
-    if (!SW3_PopulateSyscallList()) return NULL;
+    PVOID DllBase = GetNtdllBase();
+    if (!DllBase) return NULL;
 
-    for (DWORD i = 0; i < SW3_SyscallList.Count; i++)
+    PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER)DllBase;
+    PIMAGE_NT_HEADERS NtHeaders = SW3_RVA2VA(PIMAGE_NT_HEADERS, DllBase, DosHeader->e_lfanew);
+    PIMAGE_DATA_DIRECTORY DataDirectory = (PIMAGE_DATA_DIRECTORY)NtHeaders->OptionalHeader.DataDirectory;
+    DWORD VirtualAddress = DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (VirtualAddress == 0) return NULL;
+
+    PIMAGE_EXPORT_DIRECTORY ExportDirectory = (PIMAGE_EXPORT_DIRECTORY)SW3_RVA2VA(ULONG_PTR, DllBase, VirtualAddress);
+    DWORD NumberOfNames = ExportDirectory->NumberOfNames;
+    PDWORD Functions = SW3_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfFunctions);
+    PDWORD Names = SW3_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfNames);
+    PWORD Ordinals = SW3_RVA2VA(PWORD, DllBase, ExportDirectory->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < NumberOfNames; i++)
     {
-        if (FunctionHash == SW3_SyscallList.Entries[i].Hash)
+        PCHAR FunctionName = SW3_RVA2VA(PCHAR, DllBase, Names[i]);
+        if (*(USHORT*)FunctionName == 0x775a) // Check for "Zw"
         {
-            PVOID SyscallAddr = SW3_SyscallList.Entries[i].SyscallAddress;
-            memset(&SW3_SyscallList, 0, sizeof(SW3_SyscallList));
-            return SyscallAddr;
+            DWORD CurrentHash = SW3_HashSyscall(FunctionName);
+            if (CurrentHash == FunctionHash)
+            {
+                PVOID NtApiAddress = SW3_RVA2VA(PVOID, DllBase, Functions[Ordinals[i]]);
+                return SC_Address(NtApiAddress);
+            }
         }
     }
-
     return NULL;
 }
 
 DWORD SW3_GetSyscallNumber(DWORD FunctionHash)
 {
-    // Ensure SW3_SyscallList is populated.
-    if (!SW3_PopulateSyscallList()) return -1;
+    PVOID DllBase = GetNtdllBase();
+    if (!DllBase) return -1;
 
-    for (DWORD i = 0; i < SW3_SyscallList.Count; i++)
+    PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER)DllBase;
+    PIMAGE_NT_HEADERS NtHeaders = SW3_RVA2VA(PIMAGE_NT_HEADERS, DllBase, DosHeader->e_lfanew);
+    PIMAGE_DATA_DIRECTORY DataDirectory = (PIMAGE_DATA_DIRECTORY)NtHeaders->OptionalHeader.DataDirectory;
+    DWORD VirtualAddress = DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (VirtualAddress == 0) return -1;
+
+    PIMAGE_EXPORT_DIRECTORY ExportDirectory = (PIMAGE_EXPORT_DIRECTORY)SW3_RVA2VA(ULONG_PTR, DllBase, VirtualAddress);
+    DWORD NumberOfNames = ExportDirectory->NumberOfNames;
+    PDWORD Functions = SW3_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfFunctions);
+    PDWORD Names = SW3_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfNames);
+    PWORD Ordinals = SW3_RVA2VA(PWORD, DllBase, ExportDirectory->AddressOfNameOrdinals);
+
+    // 收集所有 Zw* 函数的地址并按地址排序以推导系统调用号
+    typedef struct {
+        DWORD Address;
+        DWORD Hash;
+    } SyscallEntry;
+    SyscallEntry TempEntries[600]; // 临时数组，假设最多 600 个 Zw* 函数
+    DWORD Count = 0;
+
+    for (DWORD i = 0; i < NumberOfNames; i++)
     {
-        if (FunctionHash == SW3_SyscallList.Entries[i].Hash)
+        PCHAR FunctionName = SW3_RVA2VA(PCHAR, DllBase, Names[i]);
+        if (*(USHORT*)FunctionName == 0x775a) // Check for "Zw"
         {
-            memset(&SW3_SyscallList, 0, sizeof(SW3_SyscallList));
-            return i;
+            TempEntries[Count].Hash = SW3_HashSyscall(FunctionName);
+            TempEntries[Count].Address = Functions[Ordinals[i]];
+            Count++;
+            if (Count >= 600) break;
         }
     }
 
+    // 按地址排序
+    for (DWORD i = 0; i < Count - 1; i++)
+    {
+        for (DWORD j = 0; j < Count - i - 1; j++)
+        {
+            if (TempEntries[j].Address > TempEntries[j + 1].Address)
+            {
+                SyscallEntry Temp = TempEntries[j];
+                TempEntries[j] = TempEntries[j + 1];
+                TempEntries[j + 1] = Temp;
+            }
+        }
+    }
+
+    // 查找匹配的哈希并返回索引作为系统调用号
+    for (DWORD i = 0; i < Count; i++)
+    {
+        if (TempEntries[i].Hash == FunctionHash)
+        {
+            return i;
+        }
+    }
     return -1;
 }
 /*========================================
@@ -185,7 +189,18 @@ https://github.com/klezVirus/SysWhispers3
 ========================================*/
 
 LONG WINAPI ExceptionHandler(PEXCEPTION_POINTERS pExceptInfo) {
-    if (pExceptInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+    if (pExceptInfo->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        if (Params.IsLegacy == 1) {
+            pExceptInfo->ContextRecord->Dr0 = (DWORD_PTR)SW3_GetSyscallAddress(0x022B80BFE);
+        }
+        else {
+            pExceptInfo->ContextRecord->Dr0 = (DWORD_PTR)SW3_GetSyscallAddress(Params.FuncHash);
+        }
+        pExceptInfo->ContextRecord->Dr7 = 0x00000303;
+        pExceptInfo->ContextRecord->Rip = pExceptInfo->ContextRecord->Rip + 6;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    else { // 默认其他异常都是单步异常
         pExceptInfo->ContextRecord->Rcx = Params.param[1];
         pExceptInfo->ContextRecord->Rdx = Params.param[2];
         pExceptInfo->ContextRecord->R8 = Params.param[3];
@@ -200,21 +215,11 @@ LONG WINAPI ExceptionHandler(PEXCEPTION_POINTERS pExceptInfo) {
         }
         if (Params.IsLegacy = 1) {
             pExceptInfo->ContextRecord->Rax = SW3_GetSyscallNumber(Params.FuncHash);
+            pExceptInfo->ContextRecord->Rip = SW3_GetSyscallAddress(Params.FuncHash);
         }
         pExceptInfo->ContextRecord->Dr0 = 0;
         pExceptInfo->ContextRecord->Dr7 = 0; // 清除调试寄存器 防止内核态对硬件断点的检测
         memset(&Params, 0, sizeof(Params));
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    else if (pExceptInfo->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        if (Params.IsLegacy = 1) {
-            pExceptInfo->ContextRecord->Dr0 = (DWORD_PTR)SW3_GetSyscallAddress(0x022B80BFE);
-        }
-        else {
-            pExceptInfo->ContextRecord->Dr0 = (DWORD_PTR)SW3_GetSyscallAddress(Params.FuncHash);
-        }
-        pExceptInfo->ContextRecord->Dr7 = 0x00000303;
-        pExceptInfo->ContextRecord->Rip = pExceptInfo->ContextRecord->Rip + 6;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -222,15 +227,28 @@ LONG WINAPI ExceptionHandler(PEXCEPTION_POINTERS pExceptInfo) {
 
 // Galaxy Gate - NextGen
 NTSTATUS SFNtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength) {
-    Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)ObjectAttributes; Params.param[4] = (DWORD_PTR)IoStatusBlock; Params.param[5] = (DWORD_PTR)AllocationSize; Params.param[6] = (DWORD_PTR)FileAttributes; Params.param[7] = (DWORD_PTR)ShareAccess; Params.param[8] = (DWORD_PTR)CreateDisposition; Params.param[9] = (DWORD_PTR)CreateOptions; Params.param[10] = (DWORD_PTR)EaBuffer; Params.param[11] = (DWORD_PTR)EaLength; Params.ParamNum = 11; Params.FuncHash = 0x0BDDB5F9C; Params.IsLegacy = 0; *NullPointer = 1; TCHAR tempFileName[MAX_PATH];
-    GetTempFileName(0, 0, 0, tempFileName);return 0;
-} // GetTempFileName -> NtCreateFile
+    Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)ObjectAttributes; Params.param[4] = (DWORD_PTR)IoStatusBlock; Params.param[5] = (DWORD_PTR)AllocationSize; Params.param[6] = (DWORD_PTR)FileAttributes; Params.param[7] = (DWORD_PTR)ShareAccess; Params.param[8] = (DWORD_PTR)CreateDisposition; Params.param[9] = (DWORD_PTR)CreateOptions; Params.param[10] = (DWORD_PTR)EaBuffer; Params.param[11] = (DWORD_PTR)EaLength; Params.ParamNum = 11;
+    Params.IsLegacy = 0;Params.FuncHash = 0x0BDDB5F9C;*NullPointer = 1;
+    TCHAR tempFileName[MAX_PATH];GetTempFileName(0, 0, 0, tempFileName);return 0;
+}
 NTSTATUS SFNtWriteFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key) {
-    Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)Event; Params.param[3] = (DWORD_PTR)ApcRoutine; Params.param[4] = (DWORD_PTR)ApcContext; Params.param[5] = (DWORD_PTR)IoStatusBlock; Params.param[6] = (DWORD_PTR)Buffer; Params.param[7] = (DWORD_PTR)Length; Params.param[8] = (DWORD_PTR)ByteOffset; Params.param[9] = (DWORD_PTR)Key; Params.ParamNum = 9; *NullPointer = 1; Params.IsLegacy = 0;
+    Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)Event; Params.param[3] = (DWORD_PTR)ApcRoutine; Params.param[4] = (DWORD_PTR)ApcContext; Params.param[5] = (DWORD_PTR)IoStatusBlock; Params.param[6] = (DWORD_PTR)Buffer; Params.param[7] = (DWORD_PTR)Length; Params.param[8] = (DWORD_PTR)ByteOffset; Params.param[9] = (DWORD_PTR)Key; Params.ParamNum = 9;
+    Params.IsLegacy = 0;Params.FuncHash = 0x0A4B2DEA5; *NullPointer = 1;
     WritePrivateProfileString("StarFly", "Version", "2.0", "Version.ini"); return 0;
-} // WritePrivateProfileString -> NtWriteFile
+}
+NTSTATUS SFNtQueryInformationProcess(HANDLE ProcessHandle, PROCESSINFOCLASS ProcessInformationClass, PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength) {
+    Params.param[1] = (DWORD_PTR)ProcessHandle; Params.param[2] = (DWORD_PTR)ProcessInformationClass; Params.param[3] = (DWORD_PTR)ProcessInformation; Params.param[4] = (DWORD_PTR)ProcessInformationLength; Params.param[5] = (DWORD_PTR)ReturnLength; Params.ParamNum = 5;
+    Params.FuncHash = 0x0DD27CE88; Params.IsLegacy = 0; *NullPointer = 1;
+    SYSTEM_INFO si;GetSystemInfo(&si); return 0;
+}
+NTSTATUS SFNtQuerySystemInformation(SYSTEM_INFORMATION_CLASS SystemInformationClass, PVOID SystemInformation, ULONG SystemInformationLength, PULONG ReturnLength) {
+    Params.param[1] = (DWORD_PTR)SystemInformationClass; Params.param[2] = (DWORD_PTR)SystemInformation; Params.param[3] = (DWORD_PTR)SystemInformationLength; Params.param[4] = (DWORD_PTR)ReturnLength; Params.ParamNum = 4;
+    Params.FuncHash = 0x09E349EA7; Params.IsLegacy = 0; *NullPointer = 1;
+    SYSTEM_INFO si;GetSystemInfo(&si); return 0;
+}
 
 // Galaxy Gate - Legacy
+NTSTATUS SFNtOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId) { Params.param[1] = (DWORD_PTR)ProcessHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)ObjectAttributes; Params.param[4] = (DWORD_PTR)ClientId; Params.ParamNum = 4; Params.FuncHash = 0x0FEA4D138; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtAccessCheck(PSECURITY_DESCRIPTOR pSecurityDescriptor, HANDLE ClientToken, ACCESS_MASK DesiaredAccess, PGENERIC_MAPPING GenericMapping, PPRIVILEGE_SET PrivilegeSet, PULONG PrivilegeSetLength, PACCESS_MASK GrantedAccess, PBOOLEAN AccessStatus) { Params.param[1] = (DWORD_PTR)pSecurityDescriptor; Params.param[2] = (DWORD_PTR)ClientToken; Params.param[3] = (DWORD_PTR)DesiaredAccess; Params.param[4] = (DWORD_PTR)GenericMapping; Params.param[5] = (DWORD_PTR)PrivilegeSet; Params.param[6] = (DWORD_PTR)PrivilegeSetLength; Params.param[7] = (DWORD_PTR)GrantedAccess; Params.param[8] = (DWORD_PTR)AccessStatus; Params.ParamNum = 8; Params.FuncHash = 0x0429E3D77; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtWorkerFactoryWorkerReady(HANDLE WorkerFactoryHandle) { Params.param[1] = (DWORD_PTR)WorkerFactoryHandle; Params.ParamNum = 1; Params.FuncHash = 0x093BB77D7; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtAcceptConnectPort(PHANDLE ServerPortHandle, ULONG AlternativeReceivePortHandle, PPORT_MESSAGE ConnectionReply, BOOLEAN AcceptConnection, PPORT_SECTION_WRITE ServerSharedMemory, PPORT_SECTION_READ ClientSharedMemory) { Params.param[1] = (DWORD_PTR)ServerPortHandle; Params.param[2] = (DWORD_PTR)AlternativeReceivePortHandle; Params.param[3] = (DWORD_PTR)ConnectionReply; Params.param[4] = (DWORD_PTR)AcceptConnection; Params.param[5] = (DWORD_PTR)ServerSharedMemory; Params.param[6] = (DWORD_PTR)ClientSharedMemory; Params.ParamNum = 6; Params.FuncHash = 0x024B23D18; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
@@ -255,7 +273,6 @@ NTSTATUS SFNtQueryDefaultLocale(BOOLEAN UserProfile, PLCID DefaultLocaleId) { Pa
 NTSTATUS SFNtQueryKey(HANDLE KeyHandle, KEY_INFORMATION_CLASS KeyInformationClass, PVOID KeyInformation, ULONG Length, PULONG ResultLength) { Params.param[1] = (DWORD_PTR)KeyHandle; Params.param[2] = (DWORD_PTR)KeyInformationClass; Params.param[3] = (DWORD_PTR)KeyInformation; Params.param[4] = (DWORD_PTR)Length; Params.param[5] = (DWORD_PTR)ResultLength; Params.ParamNum = 5; Params.FuncHash = 0x09F0BB2AD; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtQueryValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName, KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass, PVOID KeyValueInformation, ULONG Length, PULONG ResultLength) { Params.param[1] = (DWORD_PTR)KeyHandle; Params.param[2] = (DWORD_PTR)ValueName; Params.param[3] = (DWORD_PTR)KeyValueInformationClass; Params.param[4] = (DWORD_PTR)KeyValueInformation; Params.param[5] = (DWORD_PTR)Length; Params.param[6] = (DWORD_PTR)ResultLength; Params.ParamNum = 6; Params.FuncHash = 0x0261BD761; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, ULONG ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect) { Params.param[1] = (DWORD_PTR)ProcessHandle; Params.param[2] = (DWORD_PTR)BaseAddress; Params.param[3] = (DWORD_PTR)ZeroBits; Params.param[4] = (DWORD_PTR)RegionSize; Params.param[5] = (DWORD_PTR)AllocationType; Params.param[6] = (DWORD_PTR)Protect; Params.ParamNum = 6; Params.FuncHash = 0x00114EF73; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
-NTSTATUS SFNtQueryInformationProcess(HANDLE ProcessHandle, PROCESSINFOCLASS ProcessInformationClass, PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength) { Params.param[1] = (DWORD_PTR)ProcessHandle; Params.param[2] = (DWORD_PTR)ProcessInformationClass; Params.param[3] = (DWORD_PTR)ProcessInformation; Params.param[4] = (DWORD_PTR)ProcessInformationLength; Params.param[5] = (DWORD_PTR)ReturnLength; Params.ParamNum = 5; Params.FuncHash = 0x0DD27CE88; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtWaitForMultipleObjects32(ULONG ObjectCount, PHANDLE Handles, WAIT_TYPE WaitType, BOOLEAN Alertable, PLARGE_INTEGER Timeout) { Params.param[1] = (DWORD_PTR)ObjectCount; Params.param[2] = (DWORD_PTR)Handles; Params.param[3] = (DWORD_PTR)WaitType; Params.param[4] = (DWORD_PTR)Alertable; Params.param[5] = (DWORD_PTR)Timeout; Params.ParamNum = 5; Params.FuncHash = 0x0B49D2D72; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtWriteFileGather(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PFILE_SEGMENT_ELEMENT SegmentArray, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key) { Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)Event; Params.param[3] = (DWORD_PTR)ApcRoutine; Params.param[4] = (DWORD_PTR)ApcContext; Params.param[5] = (DWORD_PTR)IoStatusBlock; Params.param[6] = (DWORD_PTR)SegmentArray; Params.param[7] = (DWORD_PTR)Length; Params.param[8] = (DWORD_PTR)ByteOffset; Params.param[9] = (DWORD_PTR)Key; Params.ParamNum = 9; Params.FuncHash = 0x0039C6F07; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtCreateKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, ULONG TitleIndex, PUNICODE_STRING Class, ULONG CreateOptions, PULONG Disposition) { Params.param[1] = (DWORD_PTR)KeyHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)ObjectAttributes; Params.param[4] = (DWORD_PTR)TitleIndex; Params.param[5] = (DWORD_PTR)Class; Params.param[6] = (DWORD_PTR)CreateOptions; Params.param[7] = (DWORD_PTR)Disposition; Params.ParamNum = 7; Params.FuncHash = 0x01D1D3CA6; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
@@ -267,7 +284,6 @@ NTSTATUS SFNtRequestWaitReplyPort(HANDLE PortHandle, PPORT_MESSAGE RequestMessag
 NTSTATUS SFNtQueryVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, MEMORY_INFORMATION_CLASS MemoryInformationClass, PVOID MemoryInformation, SIZE_T MemoryInformationLength, PSIZE_T ReturnLength) { Params.param[1] = (DWORD_PTR)ProcessHandle; Params.param[2] = (DWORD_PTR)BaseAddress; Params.param[3] = (DWORD_PTR)MemoryInformationClass; Params.param[4] = (DWORD_PTR)MemoryInformation; Params.param[5] = (DWORD_PTR)MemoryInformationLength; Params.param[6] = (DWORD_PTR)ReturnLength; Params.ParamNum = 6; Params.FuncHash = 0x003910903; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtOpenThreadToken(HANDLE ThreadHandle, ACCESS_MASK DesiredAccess, BOOLEAN OpenAsSelf, PHANDLE TokenHandle) { Params.param[1] = (DWORD_PTR)ThreadHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)OpenAsSelf; Params.param[4] = (DWORD_PTR)TokenHandle; Params.ParamNum = 4; Params.FuncHash = 0x001D87B3C; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtQueryInformationThread(HANDLE ThreadHandle, THREADINFOCLASS ThreadInformationClass, PVOID ThreadInformation, ULONG ThreadInformationLength, PULONG ReturnLength) { Params.param[1] = (DWORD_PTR)ThreadHandle; Params.param[2] = (DWORD_PTR)ThreadInformationClass; Params.param[3] = (DWORD_PTR)ThreadInformation; Params.param[4] = (DWORD_PTR)ThreadInformationLength; Params.param[5] = (DWORD_PTR)ReturnLength; Params.ParamNum = 5; Params.FuncHash = 0x022163CA7; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
-NTSTATUS SFNtOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId) { Params.param[1] = (DWORD_PTR)ProcessHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)ObjectAttributes; Params.param[4] = (DWORD_PTR)ClientId; Params.ParamNum = 4; Params.FuncHash = 0x0FEA4D138; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtSetInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length, FILE_INFORMATION_CLASS FileInformationClass) { Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)IoStatusBlock; Params.param[3] = (DWORD_PTR)FileInformation; Params.param[4] = (DWORD_PTR)Length; Params.param[5] = (DWORD_PTR)FileInformationClass; Params.ParamNum = 5; Params.FuncHash = 0x015852515; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtMapViewOfSection(HANDLE SectionHandle, HANDLE ProcessHandle, PVOID BaseAddress, ULONG ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, SECTION_INHERIT InheritDisposition, ULONG AllocationType, ULONG Win32Protect) { Params.param[1] = (DWORD_PTR)SectionHandle; Params.param[2] = (DWORD_PTR)ProcessHandle; Params.param[3] = (DWORD_PTR)BaseAddress; Params.param[4] = (DWORD_PTR)ZeroBits; Params.param[5] = (DWORD_PTR)CommitSize; Params.param[6] = (DWORD_PTR)SectionOffset; Params.param[7] = (DWORD_PTR)ViewSize; Params.param[8] = (DWORD_PTR)InheritDisposition; Params.param[9] = (DWORD_PTR)AllocationType; Params.param[10] = (DWORD_PTR)Win32Protect; Params.ParamNum = 10; Params.FuncHash = 0x0E0C7A011; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtAccessCheckAndAuditAlarm(PUNICODE_STRING SubsystemName, PVOID HandleId, PUNICODE_STRING ObjectTypeName, PUNICODE_STRING ObjectName, PSECURITY_DESCRIPTOR SecurityDescriptor, ACCESS_MASK DesiredAccess, PGENERIC_MAPPING GenericMapping, BOOLEAN ObjectCreation, PACCESS_MASK GrantedAccess, PBOOLEAN AccessStatus, PBOOLEAN GenerateOnClose) { Params.param[1] = (DWORD_PTR)SubsystemName; Params.param[2] = (DWORD_PTR)HandleId; Params.param[3] = (DWORD_PTR)ObjectTypeName; Params.param[4] = (DWORD_PTR)ObjectName; Params.param[5] = (DWORD_PTR)SecurityDescriptor; Params.param[6] = (DWORD_PTR)DesiredAccess; Params.param[7] = (DWORD_PTR)GenericMapping; Params.param[8] = (DWORD_PTR)ObjectCreation; Params.param[9] = (DWORD_PTR)GrantedAccess; Params.param[10] = (DWORD_PTR)AccessStatus; Params.param[11] = (DWORD_PTR)GenerateOnClose; Params.ParamNum = 11; Params.FuncHash = 0x0D2AC33F1; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
@@ -283,7 +299,6 @@ NTSTATUS SFNtEnumerateKey(HANDLE KeyHandle, ULONG Index, KEY_INFORMATION_CLASS K
 NTSTATUS SFNtOpenFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock, ULONG ShareAccess, ULONG OpenOptions) { Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)ObjectAttributes; Params.param[4] = (DWORD_PTR)IoStatusBlock; Params.param[5] = (DWORD_PTR)ShareAccess; Params.param[6] = (DWORD_PTR)OpenOptions; Params.ParamNum = 6; Params.FuncHash = 0x0B265E2D2; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval) { Params.param[1] = (DWORD_PTR)Alertable; Params.param[2] = (DWORD_PTR)DelayInterval; Params.ParamNum = 2; Params.FuncHash = 0x0306872B5; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtQueryDirectoryFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length, FILE_INFORMATION_CLASS FileInformationClass, BOOLEAN ReturnSingleEntry, PUNICODE_STRING FileName, BOOLEAN RestartScan) { Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)Event; Params.param[3] = (DWORD_PTR)ApcRoutine; Params.param[4] = (DWORD_PTR)ApcContext; Params.param[5] = (DWORD_PTR)IoStatusBlock; Params.param[6] = (DWORD_PTR)FileInformation; Params.param[7] = (DWORD_PTR)Length; Params.param[8] = (DWORD_PTR)FileInformationClass; Params.param[9] = (DWORD_PTR)ReturnSingleEntry; Params.param[10] = (DWORD_PTR)FileName; Params.param[11] = (DWORD_PTR)RestartScan; Params.ParamNum = 11; Params.FuncHash = 0x0B2198292; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
-NTSTATUS SFNtQuerySystemInformation(SYSTEM_INFORMATION_CLASS SystemInformationClass, PVOID SystemInformation, ULONG SystemInformationLength, PULONG ReturnLength) { Params.param[1] = (DWORD_PTR)SystemInformationClass; Params.param[2] = (DWORD_PTR)SystemInformation; Params.param[3] = (DWORD_PTR)SystemInformationLength; Params.param[4] = (DWORD_PTR)ReturnLength; Params.ParamNum = 4; Params.FuncHash = 0x09E349EA7; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtOpenSection(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes) { Params.param[1] = (DWORD_PTR)SectionHandle; Params.param[2] = (DWORD_PTR)DesiredAccess; Params.param[3] = (DWORD_PTR)ObjectAttributes; Params.ParamNum = 3; Params.FuncHash = 0x009A5E9F3; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtQueryTimer(HANDLE TimerHandle, TIMER_INFORMATION_CLASS TimerInformationClass, PVOID TimerInformation, ULONG TimerInformationLength, PULONG ReturnLength) { Params.param[1] = (DWORD_PTR)TimerHandle; Params.param[2] = (DWORD_PTR)TimerInformationClass; Params.param[3] = (DWORD_PTR)TimerInformation; Params.param[4] = (DWORD_PTR)TimerInformationLength; Params.param[5] = (DWORD_PTR)ReturnLength; Params.ParamNum = 5; Params.FuncHash = 0x0B11BE1B8; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtFsControlFile(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, ULONG FsControlCode, PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer, ULONG OutputBufferLength) { Params.param[1] = (DWORD_PTR)FileHandle; Params.param[2] = (DWORD_PTR)Event; Params.param[3] = (DWORD_PTR)ApcRoutine; Params.param[4] = (DWORD_PTR)ApcContext; Params.param[5] = (DWORD_PTR)IoStatusBlock; Params.param[6] = (DWORD_PTR)FsControlCode; Params.param[7] = (DWORD_PTR)InputBuffer; Params.param[8] = (DWORD_PTR)InputBufferLength; Params.param[9] = (DWORD_PTR)OutputBuffer; Params.param[10] = (DWORD_PTR)OutputBufferLength; Params.ParamNum = 10; Params.FuncHash = 0x069D3A98B; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
@@ -710,32 +725,3 @@ NTSTATUS SFNtRequestWakeupLatency(ULONG LatencyTime) { Params.param[1] = (DWORD_
 NTSTATUS SFNtQuerySystemTime(PLARGE_INTEGER SystemTime) { Params.param[1] = (DWORD_PTR)SystemTime; Params.ParamNum = 1; Params.FuncHash = 0x09A0F97AF; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtManageHotPatch(ULONG UnknownParameter1, ULONG UnknownParameter2, ULONG UnknownParameter3, ULONG UnknownParameter4) { Params.param[1] = (DWORD_PTR)UnknownParameter1; Params.param[2] = (DWORD_PTR)UnknownParameter2; Params.param[3] = (DWORD_PTR)UnknownParameter3; Params.param[4] = (DWORD_PTR)UnknownParameter4; Params.ParamNum = 4; Params.FuncHash = 0x0FC4230E6; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
 NTSTATUS SFNtContinueEx(PCONTEXT ContextRecord, PKCONTINUE_ARGUMENT ContinueArgument) { Params.param[1] = (DWORD_PTR)ContextRecord; Params.param[2] = (DWORD_PTR)ContinueArgument; Params.ParamNum = 2; Params.FuncHash = 0x0F360C6DD; Params.IsLegacy = 1; *NullPointer = 1; GetFileAttributesW(L"C:\\Windows\\notepad.exe"); return 0; }
-
-DWORD_PTR ConvertProcNameToPid(wchar_t* ProcName) {
-    ULONG bufferSize = 1024 * 1024;
-    PVOID buffer = malloc(bufferSize);
-    ULONG returnLength = 0;
-    SFNtQuerySystemInformation(SystemProcessInformation, buffer, bufferSize, &returnLength);
-    PSYSTEM_PROCESS_INFORMATION pInfo = (PSYSTEM_PROCESS_INFORMATION)buffer;
-    while (TRUE) {
-        if (pInfo->ImageName.Buffer && wcsstr(pInfo->ImageName.Buffer, ProcName)) {
-            DWORD_PTR pid = (DWORD_PTR)pInfo->UniqueProcessId;
-            free(buffer);
-            return pid;
-        }
-        if (pInfo->NextEntryOffset == 0) {
-            break;
-        }
-        pInfo = (PSYSTEM_PROCESS_INFORMATION)((BYTE*)pInfo + pInfo->NextEntryOffset);
-    }
-    free(buffer);
-    return 0;
-}
-
-int main() {
-    AddVectoredExceptionHandler(1, ExceptionHandler);
-    DWORD_PTR WinLogonPid = ConvertProcNameToPid(L"inlog"); //  = Winlogon.exe
-    printf("[+] WinLogon PID Found: %lu\n", (unsigned long)WinLogonPid);
-    system("pause");
-    return 0;
-}
