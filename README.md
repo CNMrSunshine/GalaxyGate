@@ -25,16 +25,4 @@ GalaxyGate 提供两种操作模式：
 GalaxyGate 的灵感来源于 `SilentMoonWalk` 调用堆栈欺骗项目。与其使用伪造的调用堆栈以假乱真，GalaxyGate 选择直接利用真实的函数调用堆栈，从而提升隐蔽性和自然性。
 
 
-## 与类似项目比较
-
-在首个版本发布两个月后，在 `Github` 发现一个类似项目（Grok3找到的）：[LayeredSyscall](https://github.com/WKL-Sec/LayeredSyscall)。
-
-### 与 LayeredSyscall 的比较
-
-| 特性                  | GalaxyGate                         | LayeredSyscall                     |
-|----------------------|------------------------------------|------------------------------------|
-| **傀儡函数**          | 可选择多种高层函数 | 固定为 `MessageBoxW`               |
-| **拦截方式**          | 拦截 `Syscall` 指令码              | 拦截 `Syscall` `ret` 指令码                  |
-| **副作用**            | 无明显副作用                       | 未拦截 `ret` 会导致消息框弹出             |
-| **调试寄存器清理**    | 在系统调用前清零，避免内核态检测           | 未在系统调用前清零，可能留下痕迹               |
-| **调用堆栈自然性**    | 高度自然，符合函数调用逻辑         | 不自然，`Nt*` 函数与 `MessageBoxW` 无直接关联 |
+## 该项目当前已与StarFly项目整合 后续更新将推送至[StarFly仓库](https://github.com/cnmrsunshine/starfly)
